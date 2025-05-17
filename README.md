@@ -28,7 +28,6 @@ Software: Python, pandas, NumPy, matplotlib
 
 References:
 ● Basketball reference
-● https://grantland.com/features/how-kobe-bryant-missed-shots-translate-new-nba-st
-atistic-kobe-assist/
+● https://grantland.com/features/how-kobe-bryant-missed-shots-translate-new-nba-statistic-kobe-assist/
 ● Python documentation
 
