@@ -6,5 +6,5 @@ This was originally a project I made as my AI-102 semester project. Since then I
 The report and Original python lab project are in another branch of this github repo
 
 References:
-  https://github.com/swar/nba_api
+  https://github.com/swar/nba_api,                                                                                                                                  
   https://grantland.com/features/how-kobe-bryant-missed-shots-translate-new-nba-statistic-kobe-assist/
