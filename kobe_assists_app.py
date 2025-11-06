@@ -6,7 +6,7 @@ metric for NBA players by analyzing play-by-play data from the `nba_api`.
 
 High-level flow:
 - Load player list for a chosen season
-- Sample the most recent N games for a selected player
+- Sample the N games for a selected player
 - For each missed shot by the player, inspect the following plays to
     determine if an offensive rebound and subsequent score occurred
     (within a short window) — these points are counted as 'Kobe assists'.
@@ -63,8 +63,7 @@ def get_sample_games(player_id, season, n=15):
     Returns:
         list[int]: list of Game_ID values (may be empty).
     """
-    # Small sleep to respect public API rate limits
-    time.sleep(0.6)
+    time.sleep(1)
     try:
         game_log = playergamelog.PlayerGameLog(player_id=player_id, season=season).get_data_frames()[0]
         sample_games = game_log.head(n)
@@ -75,46 +74,25 @@ def get_sample_games(player_id, season, n=15):
 # --- Kobe Assist Calculation Logic ---
 
 def is_missed_shot(play):
-    """Return True if the play record represents a missed field goal.
-
-    The `EVENTMSGTYPE` field is used by the NBA play-by-play feed where
-    type 2 indicates a missed shot.
-    """
     return play.get('EVENTMSGTYPE', 0) == 2
 
 def is_offensive_rebound(play, shooting_team_id):
-    """Return True when a play is an offensive rebound for the shooting team.
-
-    The NBA feed uses `EVENTMSGTYPE == 4` for rebounds. We compare
-    the rebounding player's team id to the provided shooting_team_id
-    to determine whether it is an offensive rebound.
-    """
     event_type = play.get('EVENTMSGTYPE', 0)
     team_id = play.get('PLAYER1_TEAM_ID', 0)
     return event_type == 4 and team_id == shooting_team_id
 
 def is_score(play):
-    """Return True if a play is a scoring event.
-
-    In the play-by-play feed, `EVENTMSGTYPE` values 1 and 3 correspond
-    to made field goals and made free throws respectively (or similar
-    scoring events). This small helper centralizes that logic.
-    """
-    return play.get('EVENTMSGTYPE', 0) in [1, 3]
+    event_type = play.get('EVENTMSGTYPE', 0)
+    return event_type in [1, 3]
 
 def extract_points_from_play(play):
-    """Infer the number of points scored from a play record.
-
-    The NBA play-by-play contains textual descriptions in
-    `HOMEDESCRIPTION` and `VISITORDESCRIPTION`. We look for keywords
-    to distinguish between 3PT, free throws, and regular 2-point
-    field goals. This is a heuristic but sufficient for this metric.
-    """
     description = str(play.get('HOMEDESCRIPTION', '')) + ' ' + str(play.get('VISITORDESCRIPTION', ''))
     if '3PT' in description or 'Three Point' in description:
         return 3
-    elif 'Free Throw' in description:
+    elif 'Free Throw' in description or 'Technical' in description:
         return 1
+    elif any(keyword in description for keyword in ['Field Goal', 'Dunk', 'Layup']):
+        return 2
     else:
         return 2
 
@@ -129,8 +107,7 @@ def analyze_game_for_kobe_assists(game_id, player_name):
 
     Returns the total Kobe Assist points found in the game (int).
     """
-    # Small sleep to avoid hammering the API in quick loops
-    time.sleep(0.6)
+    time.sleep(1)
     try:
         pbp = playbyplayv2.PlayByPlayV2(game_id=game_id).get_data_frames()[0]
         plays = pbp.to_dict('records')
@@ -168,22 +145,46 @@ def check_kobe_assist_sequence(plays, missed_shot_index, shooting_team_id):
     # Look ahead a small number of plays to keep the heuristic tight
     for i in range(missed_shot_index + 1, min(len(plays), missed_shot_index + 8)):
         current_play = plays[i]
-        if not found_offensive_rebound and is_offensive_rebound(current_play, shooting_team_id):
-            found_offensive_rebound = True
 
-        if found_offensive_rebound:
-            # If the team that got the offensive rebound scored, add points
-            if is_score(current_play) and current_play.get('PLAYER1_TEAM_ID', 0) == shooting_team_id:
-                total_points += extract_points_from_play(current_play)
-
+        # If we haven't yet found an offensive rebound, check for it and
+        # also bail out if the possession clearly changed (defensive rebound
+        # or turnover) before an offensive rebound occurred.
+        if not found_offensive_rebound:
+            if is_offensive_rebound(current_play, shooting_team_id):
+                found_offensive_rebound = True
+                # continue so the next play after the rebound can be checked
+                continue
             event_type = current_play.get('EVENTMSGTYPE', 0)
-            if event_type == 5:  # Turnover - sequence broken
+            if event_type in [4, 5]:  # Rebound or turnover -> possession changed
                 break
-            elif event_type == 4:  # Rebound event
-                # Defensive rebound by the other team ends the sequence
-                if current_play.get('PLAYER1_TEAM_ID', 0) != shooting_team_id:
+
+        # If we found an offensive rebound, look for scores by the same team
+        if found_offensive_rebound:
+            # Only count made field goals (EVENTMSGTYPE == 1). Exclude free throws/technical points.
+            event_type = current_play.get('EVENTMSGTYPE', 0)
+            if event_type == 1:
+                scoring_team_id = current_play.get('PLAYER1_TEAM_ID', 0)
+                if scoring_team_id == shooting_team_id:
+                    # Count one Kobe assist for the sequence regardless of point value
+                    total_points += 1
                     break
-    return total_points
+
+            # Check for possession-ending events after the offensive rebound
+            event_type = current_play.get('EVENTMSGTYPE', 0)
+            if event_type == 5:  # Turnover ends possession
+                break
+            elif event_type == 4:  # Defensive rebound ends our possession
+                rebounding_team = current_play.get('PLAYER1_TEAM_ID', 0)
+                if rebounding_team != shooting_team_id:
+                    break
+    
+            # If no offensive rebound found yet and we hit a clear possession change
+            if not found_offensive_rebound:
+                event_type = current_play.get('EVENTMSGTYPE', 0)
+                if event_type in [4, 5]:  # Rebound or turnover
+                    break
+
+    return total_points if found_offensive_rebound else 0
 
 def calculate_player_kobe_assist_average(app_instance, player_name, player_id, season, sample_size):
     """Background worker that computes the Kobe Assist average for a player.
